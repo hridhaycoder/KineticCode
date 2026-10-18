@@ -1,3 +1,4 @@
+from langchain.tools import tool
 from openrouter import OpenRouter
 from dotenv import load_dotenv
 import os
@@ -12,7 +13,15 @@ for name, value in [("HACK_CLUB_API_KEY", api_key), ("ROUTER_URL", url), ("MODEL
     if not value:
         print(name,"is missing")
 
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply `a` and `b`.
 
+    Args:
+        a: First int
+        b: Second int
+    """
+    return a * b
 
 client = OpenRouter(
     api_key=api_key,
@@ -36,6 +45,7 @@ while True:
             model=model,
             messages=history,
             stream=True,
+            tools=[multiply]
         )
 
         print("Bot: ", end="", flush=True)
