@@ -13,15 +13,6 @@ for name, value in [("HACK_CLUB_API_KEY", api_key), ("ROUTER_URL", url), ("MODEL
     if not value:
         print(name,"is missing")
 
-@tool
-def multiply(a: int, b: int) -> int:
-    """Multiply `a` and `b`.
-
-    Args:
-        a: First int
-        b: Second int
-    """
-    return a * b
 
 client = OpenRouter(
     api_key=api_key,
@@ -44,8 +35,7 @@ while True:
         stream = client.chat.send(
             model=model,
             messages=history,
-            stream=True,
-            tools=[multiply]
+            stream=True
         )
 
         print("Bot: ", end="", flush=True)
