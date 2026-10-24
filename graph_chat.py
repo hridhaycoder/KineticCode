@@ -3,7 +3,10 @@ from dotenv import load_dotenv
 from langchain_core.tools import tool
 from langchain_openrouter import ChatOpenRouter
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage, SystemMessage
+from pathlib import Path
+import difflib
+from langgraph.errors import GraphRecursionError
 
 
 load_dotenv()
@@ -29,26 +32,198 @@ model = ChatOpenRouter(
     api_key=api_key
 )
 
+ROOT = Path.cwd().resolve()
+SKIP_DIRS = {".venv", ".git", "node_modules", "__pycache__"}
+MAX_READ_CHARS = 20_000
+MAX_SEARCH_RESULTS = 50
+
+
+def safe_path(p: str) -> Path:
+    """Turn a model-supplied path into a real path, refusing anything outside ROOT."""
+    full = (ROOT / p).resolve()
+    if not full.is_relative_to(ROOT):
+        raise ValueError(f"'{p}' is outside the project folder.")
+    return full
+
 
 @tool
-def multiply(a: int, b: int) -> int:
-    """Multiply `a` and `b`.
+def list_files(path: str = ".") -> str:
+    """List the files and folders inside a folder of the project.
 
     Args:
-        a: First int
-        b: Second int
+        path: Folder to list, relative to the project root. Defaults to the root.
     """
-    return a * b
+    try:
+        folder = safe_path(path)
+        if not folder.is_dir():
+            return f"Error: '{path}' is not a folder or does not exist."
+        entries = []
+        for item in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+            if item.name in SKIP_DIRS:
+                continue
+            entries.append(item.name + ("/" if item.is_dir() else ""))
+        return "\n".join(entries) or "(empty folder)"
+    except (ValueError, OSError) as e:
+        return f"Error: {e}"
 
-model_with_tools = model.bind_tools(tools=[multiply])
+
+@tool
+def read_file(path: str) -> str:
+    """Read a text file from the project and return it with line numbers.
+    Long files are cut off.
+
+    Args:
+        path: File to read, relative to the project root.
+    """
+    try:
+        file = safe_path(path)
+        if not file.is_file():
+            return f"Error: '{path}' is not a file or does not exist."
+        with file.open(encoding="utf-8") as f:
+            text = f.read(MAX_READ_CHARS + 1)
+    except UnicodeDecodeError:
+        return f"Error: '{path}' looks like a binary file and can't be read as text."
+    except (ValueError, OSError) as e:
+        return f"Error: {e}"
+
+    truncated = len(text) > MAX_READ_CHARS
+    text = text[:MAX_READ_CHARS]
+    numbered = "\n".join(
+        f"{i}: {line}" for i, line in enumerate(text.splitlines(), start=1)
+    )
+    if truncated:
+        numbered += f"\n... [cut off after {MAX_READ_CHARS} characters]"
+    return numbered or "(empty file)"
+
+
+@tool
+def search_files(query: str, path: str = ".") -> str:
+    """Search the project's text files for a string (case-insensitive).
+    Returns matching lines as 'file:line: text'.
+
+    Args:
+        query: Text to look for.
+        path: Folder to search in, relative to the project root. Defaults to the root.
+    """
+    try:
+        start = safe_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
+    if not start.is_dir():
+        return f"Error: '{path}' is not a folder or does not exist."
+
+    needle = query.lower()
+    matches = []
+    for dirpath, dirnames, filenames in start.walk():
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]  # skip noisy folders
+        for name in filenames:
+            file = dirpath / name
+            if not file.resolve().is_relative_to(ROOT):  # symlink pointing outside
+                continue
+            try:
+                with file.open(encoding="utf-8") as f:
+                    for line_no, line in enumerate(f, start=1):
+                        if needle in line.lower():
+                            rel = file.relative_to(ROOT)
+                            matches.append(f"{rel}:{line_no}: {line.strip()[:200]}")
+                            if len(matches) >= MAX_SEARCH_RESULTS:
+                                matches.append(f"... [stopped after {MAX_SEARCH_RESULTS} matches]")
+                                return "\n".join(matches)
+            except (UnicodeDecodeError, OSError):
+                continue  # binary or unreadable file: skip it
+    return "\n".join(matches) or f"No matches for '{query}'."
+
+@tool
+
+def create_file(path:str, content:str) -> str:
+    """Create a new file with the given text content. Fails if the file already exists.
+
+    Args: 
+        path: path for the new file
+        content: the full text to put in the file
+
+    """
+
+    try:
+        file = safe_path(path)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        with file.open("x", encoding="utf-8") as f:
+            f.write(content)
+        return f"Created {file.relative_to(ROOT)} ({len(content)} characters)."
+    except FileExistsError:
+        return f"Error: '{path}' already exists. Use a different name or edit the file."
+    except (ValueError, OSError) as e:
+        return f"Error: {e}"
+
+@tool
+
+def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
+    """Edit a file by replacing exact text. old_text must match the file exactly,
+    including spaces and indentation, and must be unique unless replace_all is true.
+    Read the file first. Do not include line-number prefixes in old_text
+
+    Args:
+        path: File to edit, relative to the project root.
+        old_text: The exact text to replace.
+        new_text: The text to put in its place
+        replace_all: Replace every occurrence instead of requiring a single match.
+    """
+
+    if not old_text:return "Error: old_text can't be empty. To make a new file, use create_file."
+    if old_text == new_text:
+        return "Error: old_text and new_text are identical, so nothing would change."
+
+    try:
+        file = safe_path(path)
+        if not file.is_file():
+            return f"Error: '{path}' is not a file or does not exist."
+        original = file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' looks like a binary file and can't be edited as text."
+    except (ValueError, OSError) as e:
+        return f"Error: {e}"
+
+    count = original.count(old_text)
+    if count == 0:
+        return ("Error: old_text was not found. It must match the file exactly, including "
+                "indentation. Read the file again and copy the text precisely, without line numbers.")
+    if count > 1 and not replace_all:
+        return (f"Error: old_text appears {count} times. Include more surrounding lines "
+                "to make it unique, or set replace_all to true.")
+
+    updated = original.replace(old_text, new_text)
+    try:
+        file.write_text(updated, encoding="utf-8")
+    except OSError as e:
+        return f"Error: {e}"
+
+    rel = file.relative_to(ROOT)
+    diff = "".join(difflib.unified_diff(
+        original.splitlines(keepends=True),
+        updated.splitlines(keepends=True),
+        fromfile=f"a/{rel}", tofile=f"b/{rel}", n=2,
+    ))
+    return f"Edited {rel} ({count} replacement{'s' if count != 1 else ''}).\n{diff[:3000]}"
+
+
+
+tools = [list_files, read_file, search_files, create_file, edit_file]
+tools_by_name = {t.name: t for t in tools}
+model_with_tools = model.bind_tools(tools)
+
+
+SYSTEM_PROMPT = (
+    f"You are a coding assistant working in the project folder {ROOT}. "
+    "Use your tools to look at files before answering questions about the project. "
+    "All paths are relative to the project folder. Don't guess what a file contains."
+)
 
 
 def call_model(state: MessagesState):
-    reply = model_with_tools.invoke(state["messages"])
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    reply = model_with_tools.invoke(messages)
     return {"messages": [reply]}
 
-tools = [multiply]
-tools_by_name = {t.name: t for t in tools}
 
 
 def call_tools(state: MessagesState):
@@ -57,7 +232,7 @@ def call_tools(state: MessagesState):
     for call in last.tool_calls:
         tool_fn = tools_by_name[call["name"]]
         output = tool_fn.invoke(call["args"])
-        print(f"[tool] {call['name']} {call['args']} -> {output}")
+        print(f"[tool] {call['name']} {call['args']} -> {str(output)[:200]}") 
         results.append(ToolMessage(content=str(output), tool_call_id=call["id"]))
     return {"messages": results}
 
@@ -84,9 +259,13 @@ while msg != "bye":
 
     history.append({"role": "user", "content": msg})
 
-    result = graph.invoke({"messages": history})
+    try:
+        result = graph.invoke({"messages": history}, {"recursion_limit": 40})
+    except GraphRecursionError:
+        print("Agent stopped: too many steps in one turn.")
+        history.pop()  # drop the unanswered message so the history stays clean
+        continue
 
     history = result["messages"]
-    
     print(result["messages"][-1].content)
 
