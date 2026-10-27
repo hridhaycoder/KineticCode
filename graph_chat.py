@@ -4,9 +4,14 @@ from langchain_core.tools import tool
 from langchain_openrouter import ChatOpenRouter
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langchain_core.messages import ToolMessage, SystemMessage
+from langgraph.types import interrupt, Command
 from pathlib import Path
 import difflib
 from langgraph.errors import GraphRecursionError
+from langgraph.checkpoint.memory import InMemorySaver
+import uuid
+
+
 
 
 load_dotenv()
@@ -208,6 +213,7 @@ def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False
 
 
 tools = [list_files, read_file, search_files, create_file, edit_file]
+approval_needed = ["create_file", "edit_file"]
 tools_by_name = {t.name: t for t in tools}
 model_with_tools = model.bind_tools(tools)
 
@@ -227,12 +233,28 @@ def call_model(state: MessagesState):
 
 
 def call_tools(state: MessagesState):
-    last = state["messages"][-1]          # the model's reply, with the tool requests
+    last = state["messages"][-1]
     results = []
+
+    # Ask once if ANY request in this batch needs approval
+    if any(call["name"] in approval_needed for call in last.tool_calls):
+        summary = "\n".join(
+            f"  {call['name']} {str(call['args'])[:300]}" for call in last.tool_calls
+        )
+        approved = interrupt(f"The agent wants to run:\n{summary}\nAllow?")
+
+        if approved != "yes":
+            for call in last.tool_calls:
+                results.append(ToolMessage(
+                    content="The user rejected this action. Don't retry it; ask what to do instead.",
+                    tool_call_id=call["id"],
+                ))
+            return {"messages": results}
+
     for call in last.tool_calls:
         tool_fn = tools_by_name[call["name"]]
         output = tool_fn.invoke(call["args"])
-        print(f"[tool] {call['name']} {call['args']} -> {str(output)[:200]}") 
+        print(f"[tool] {call['name']} {call['args']} -> {str(output)[:200]}")
         results.append(ToolMessage(content=str(output), tool_call_id=call["id"]))
     return {"messages": results}
 
@@ -243,29 +265,42 @@ def should_continue(state: MessagesState):
         return "call_tools"               # the model asked for a tool: run it
     return END                            # no tool request: we're done
 
+
+
 builder = StateGraph(MessagesState)
 builder.add_node("call_model", call_model)
 builder.add_node("call_tools", call_tools)
 builder.add_edge(START, "call_model")
 builder.add_conditional_edges("call_model", should_continue)
 builder.add_edge("call_tools", "call_model")   # the loop
-graph = builder.compile()
+graph = builder.compile(checkpointer=InMemorySaver())
+
+
+
+
+thread_id = str(uuid.uuid4())   # the name of this conversation's save slot
 
 msg = ""
-history = []
-
 while msg != "bye":
     msg = input("> ")
-
-    history.append({"role": "user", "content": msg})
-
-    try:
-        result = graph.invoke({"messages": history}, {"recursion_limit": 40})
-    except GraphRecursionError:
-        print("Agent stopped: too many steps in one turn.")
-        history.pop()  # drop the unanswered message so the history stays clean
+    if not msg.strip():
         continue
 
-    history = result["messages"]
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 40}
+    try:
+        result = graph.invoke({"messages": [{"role": "user", "content": msg}]}, config)
+
+        while "__interrupt__" in result:
+            question = result["__interrupt__"][0].value
+            print("\n" + question)
+            answer = input("[y/n] ").strip().lower()
+            decision = "yes" if answer == "y" else "no"
+            result = graph.invoke(Command(resume=decision), config)
+
+    except GraphRecursionError:
+        print("Agent stopped: too many steps in one turn. Starting a fresh conversation.")
+        thread_id = str(uuid.uuid4())
+        continue
+
     print(result["messages"][-1].content)
 
