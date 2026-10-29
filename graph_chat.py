@@ -10,11 +10,12 @@ import difflib
 from langgraph.errors import GraphRecursionError
 from langgraph.checkpoint.memory import InMemorySaver
 import uuid
-
+import subprocess
 
 
 
 load_dotenv()
+
 
 api_key = os.getenv("HACK_CLUB_API_KEY")
 url = os.getenv("ROUTER_URL")
@@ -210,10 +211,26 @@ def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False
     ))
     return f"Edited {rel} ({count} replacement{'s' if count != 1 else ''}).\n{diff[:3000]}"
 
+@tool
+
+def shell_functions(command: str) -> str:
+    """ run a temrinal command in the shell and return the output"""
+    
+    try:
+        result = subprocess.run(command,shell=True,capture_output=True,text=True,timeout=10)
+
+        if result.returncode == 0:
+            return result.stdout if result.stdout else "Command completed successfully with no output."
+        return f"Error (Exit Code {result.returncode}): {result.stderr}"
+
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after 10 seconds."
+    except Exception as e:
+        return f"Exception occurred: {str(e)}"
 
 
-tools = [list_files, read_file, search_files, create_file, edit_file]
-approval_needed = ["create_file", "edit_file"]
+tools = [list_files, read_file, search_files, create_file, edit_file,shell_functions]
+approval_needed = ["create_file", "edit_file","shell_functions"]
 tools_by_name = {t.name: t for t in tools}
 model_with_tools = model.bind_tools(tools)
 
@@ -222,6 +239,7 @@ SYSTEM_PROMPT = (
     f"You are a coding assistant working in the project folder {ROOT}. "
     "Use your tools to look at files before answering questions about the project. "
     "All paths are relative to the project folder. Don't guess what a file contains."
+    "Use shell commands when needed and do skip use of shell commands if it's needed"
 )
 
 
