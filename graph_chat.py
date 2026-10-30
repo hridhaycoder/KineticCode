@@ -14,6 +14,7 @@ import subprocess
 
 
 
+
 load_dotenv()
 
 
@@ -35,7 +36,7 @@ if missing_vars:
 model = ChatOpenRouter(
     model=model,
     base_url=url,
-    api_key=api_key
+    api_key=api_key,    
 )
 
 ROOT = Path.cwd().resolve()
@@ -228,11 +229,20 @@ def shell_functions(command: str) -> str:
     except Exception as e:
         return f"Exception occurred: {str(e)}"
 
+web_search = {
+    "type": "openrouter:web_search",
+    "parameters": {"max_results": 3, "max_uses": 2},
+}
+
+date_time = {
+    "type": "openrouter:datetime",
+
+}
 
 tools = [list_files, read_file, search_files, create_file, edit_file,shell_functions]
 approval_needed = ["create_file", "edit_file","shell_functions"]
 tools_by_name = {t.name: t for t in tools}
-model_with_tools = model.bind_tools(tools)
+model_with_tools = model.bind_tools(tools + [web_search])
 
 
 SYSTEM_PROMPT = (
@@ -244,6 +254,9 @@ SYSTEM_PROMPT = (
     "If you don't have permission to run a command, explain why and then tell the"
     "user how to run it while giving them the appropiate information"
     "Commands have to be non interactive because there's no keyboard"
+    "You have a web search but only use when necessary to look at recent information you don't have"
+    "Do not give api keys, private file contents, or any type of confidential data when searching the web"
+    "Be honest when giving data from the web and make to sure to cite your sources and to know today's date"
 )
 
 
