@@ -4,6 +4,7 @@ from langchain_core.tools import tool
 from langchain_openrouter import ChatOpenRouter
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langchain_core.messages import ToolMessage, SystemMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import interrupt, Command
 from pathlib import Path
 import difflib
@@ -36,7 +37,8 @@ if missing_vars:
 model = ChatOpenRouter(
     model=model,
     base_url=url,
-    api_key=api_key,    
+    api_key=api_key,   
+    max_tokens=500 
 )
 
 ROOT = Path.cwd().resolve()
@@ -233,17 +235,17 @@ web_search = {
     "type": "openrouter:web_search",
     "parameters": {"max_results": 3, "max_uses": 2},
 }
-
-date_time = {
-    "type": "openrouter:datetime",
-
-}
+date_time = {"type": "openrouter:datetime"}
+server_tools = [web_search, date_time]
 
 tools = [list_files, read_file, search_files, create_file, edit_file,shell_functions]
 approval_needed = ["create_file", "edit_file","shell_functions"]
 tools_by_name = {t.name: t for t in tools}
-model_with_tools = model.bind_tools(tools + [web_search])
 
+function_tools = [convert_to_openai_tool(t) for t in tools]         
+model_with_tools = model.bind(tools=function_tools + server_tools) 
+
+print(model_with_tools.kwargs["tools"][-2:])
 
 SYSTEM_PROMPT = (
     f"You are a coding assistant working in the project folder {ROOT}. "
